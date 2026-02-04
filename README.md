@@ -9,7 +9,7 @@ A modern GUI application for transcribing audio files using Google's Gemini AI. 
 - **Conversation types**:
   - *Interview*: Includes assessment, strengths, weaknesses, recommendations
   - *Business Meeting*: Includes summary, action items, next steps
-- **Dark theme** modern UI built with CustomTkinter
+- **Dark theme** modern UI
 - **Token usage and cost tracking**
 - **Copy to clipboard** functionality
 - **Comprehensive logging** for debugging
