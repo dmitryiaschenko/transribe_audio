@@ -1,13 +1,16 @@
 """Transcription service using Google's Gemini AI."""
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import google.generativeai as genai
+from google import genai
+from google.genai.errors import ServerError
 
 from src.config import (
     GEMINI_API_KEY,
     GEMINI_MODEL,
+    GEMINI_FALLBACK_MODEL,
     SUPPORTED_EXTENSIONS,
     get_prompt,
     calculate_cost,
@@ -45,7 +48,7 @@ class TranscriptionService:
 
     def __init__(self, api_key: Optional[str] = None):
         self._api_key = api_key or GEMINI_API_KEY
-        self._model = None
+        self._client = None
         self._initialized = False
         logger.debug("TranscriptionService created")
 
@@ -63,8 +66,7 @@ class TranscriptionService:
 
         try:
             logger.info("Initializing Gemini API client")
-            genai.configure(api_key=self._api_key)
-            self._model = genai.GenerativeModel(GEMINI_MODEL)
+            self._client = genai.Client(api_key=self._api_key)
             self._initialized = True
             logger.info(f"Gemini model '{GEMINI_MODEL}' initialized successfully")
         except Exception as e:
@@ -113,16 +115,16 @@ class TranscriptionService:
             finish_reason = candidate.finish_reason
             logger.debug(f"Response finish_reason: {finish_reason}")
 
-            if finish_reason == 3:  # SAFETY
+            if finish_reason == "SAFETY":
                 safety_ratings = getattr(candidate, "safety_ratings", [])
                 logger.warning(f"Content blocked by safety filters: {safety_ratings}")
                 raise TranscriptionError(
                     "The content was blocked by safety filters. "
                     "The audio may contain sensitive content."
                 )
-            elif finish_reason == 2:  # MAX_TOKENS
+            elif finish_reason == "MAX_TOKENS":
                 logger.warning("Response truncated due to max tokens")
-            elif finish_reason == 4:  # RECITATION
+            elif finish_reason == "RECITATION":
                 logger.warning("Response blocked due to recitation")
                 raise TranscriptionError(
                     "The response was blocked due to potential copyright issues."
@@ -159,14 +161,33 @@ class TranscriptionService:
 
         try:
             logger.debug("Uploading file to Gemini")
-            audio_file = genai.upload_file(str(path))
+            audio_file = self._client.files.upload(file=str(path))
             logger.debug("File uploaded successfully")
+
+            while audio_file.state == "PROCESSING":
+                logger.debug("File still processing, waiting...")
+                time.sleep(2)
+                audio_file = self._client.files.get(name=audio_file.name)
+
+            if audio_file.state == "FAILED":
+                raise TranscriptionError("File processing failed on Google's servers.")
+
+            logger.debug(f"File ready, state: {audio_file.state}")
 
             prompt = get_prompt(conversation_type, language)
             logger.debug(f"Generated prompt for {conversation_type}")
 
             logger.info("Generating transcription...")
-            response = self._model.generate_content([prompt, audio_file])
+            contents = [prompt, audio_file]
+            try:
+                response = self._client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+            except ServerError as e:
+                if e.code != 503:
+                    raise
+                logger.warning(
+                    f"Primary model {GEMINI_MODEL} overloaded (503), falling back to {GEMINI_FALLBACK_MODEL}"
+                )
+                response = self._client.models.generate_content(model=GEMINI_FALLBACK_MODEL, contents=contents)
             logger.info("Transcription completed")
 
             response_text = self._extract_response_text(response)

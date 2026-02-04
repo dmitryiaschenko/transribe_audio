@@ -9,7 +9,9 @@ from src.api.transcription_service import (
     TranscriptionResult,
     TranscriptionError,
 )
-from src.config import ConversationType
+from google.genai.errors import ServerError
+
+from src.config import ConversationType, GEMINI_FALLBACK_MODEL
 
 
 class TestTranscriptionResult:
@@ -85,7 +87,7 @@ class TestTranscriptionService:
         service.initialize()
 
         assert service.is_initialized
-        mock_genai.configure.assert_called_once_with(api_key="test-key")
+        mock_genai.Client.assert_called_once_with(api_key="test-key")
 
     @patch("src.api.transcription_service.genai")
     def test_initialize_idempotent(self, mock_genai):
@@ -96,7 +98,7 @@ class TestTranscriptionService:
         service.initialize()  # Second call
 
         # Should only configure once
-        assert mock_genai.configure.call_count == 1
+        assert mock_genai.Client.call_count == 1
 
     def test_validate_file_not_found(self):
         """Should raise error for non-existent file."""
@@ -125,14 +127,14 @@ class TestTranscriptionService:
     def test_transcribe_initializes_if_needed(self, mock_genai, temp_audio_file):
         """Should auto-initialize when transcribe is called."""
         # Setup mocks
-        mock_model = MagicMock()
+        mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.text = "Transcribed text"
         mock_response.usage_metadata.prompt_token_count = 100
         mock_response.usage_metadata.candidates_token_count = 50
         mock_response.usage_metadata.total_token_count = 150
-        mock_model.generate_content.return_value = mock_response
-        mock_genai.GenerativeModel.return_value = mock_model
+        mock_client.models.generate_content.return_value = mock_response
+        mock_genai.Client.return_value = mock_client
 
         service = TranscriptionService(api_key="test-key")
         assert not service.is_initialized
@@ -150,14 +152,14 @@ class TestTranscriptionService:
     def test_transcribe_returns_result(self, mock_genai, temp_audio_file):
         """Should return TranscriptionResult with correct data."""
         # Setup mocks
-        mock_model = MagicMock()
+        mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.text = "Meeting notes here"
         mock_response.usage_metadata.prompt_token_count = 500
         mock_response.usage_metadata.candidates_token_count = 200
         mock_response.usage_metadata.total_token_count = 700
-        mock_model.generate_content.return_value = mock_response
-        mock_genai.GenerativeModel.return_value = mock_model
+        mock_client.models.generate_content.return_value = mock_response
+        mock_genai.Client.return_value = mock_client
 
         service = TranscriptionService(api_key="test-key")
         result = service.transcribe(
@@ -176,7 +178,9 @@ class TestTranscriptionService:
     @patch("src.api.transcription_service.genai")
     def test_transcribe_handles_api_error(self, mock_genai, temp_audio_file):
         """Should wrap API errors in TranscriptionError."""
-        mock_genai.upload_file.side_effect = Exception("API connection failed")
+        mock_client = MagicMock()
+        mock_client.files.upload.side_effect = Exception("API connection failed")
+        mock_genai.Client.return_value = mock_client
 
         service = TranscriptionService(api_key="test-key")
         service.initialize()
@@ -193,13 +197,14 @@ class TestTranscriptionService:
         """Should handle response without usage_metadata."""
         mock_model = MagicMock()
         mock_candidate = MagicMock()
-        mock_candidate.finish_reason = 1  # STOP
+        mock_candidate.finish_reason = "STOP"
         mock_candidate.content.parts = [MagicMock()]
         mock_response = MagicMock(spec=["text", "candidates"])
         mock_response.text = "Transcription"
         mock_response.candidates = [mock_candidate]
-        mock_model.generate_content.return_value = mock_response
-        mock_genai.GenerativeModel.return_value = mock_model
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+        mock_genai.Client.return_value = mock_client
 
         service = TranscriptionService(api_key="test-key")
         result = service.transcribe(
@@ -212,3 +217,52 @@ class TestTranscriptionService:
         assert result.input_tokens == 0
         assert result.output_tokens == 0
         assert result.total_cost == 0.0
+
+    @patch("src.api.transcription_service.genai")
+    def test_transcribe_fallback_on_503(self, mock_genai, temp_audio_file):
+        """Should fall back to GEMINI_FALLBACK_MODEL when primary model returns 503."""
+        mock_client = MagicMock()
+        mock_genai.Client.return_value = mock_client
+
+        # First call raises 503, second call succeeds
+        mock_response = MagicMock()
+        mock_response.text = "Fallback transcription"
+        mock_response.usage_metadata.prompt_token_count = 100
+        mock_response.usage_metadata.candidates_token_count = 50
+        mock_response.usage_metadata.total_token_count = 150
+
+        mock_client.models.generate_content.side_effect = [
+            ServerError(503, {"error": {"message": "model overloaded"}}),
+            mock_response,
+        ]
+
+        service = TranscriptionService(api_key="test-key")
+        result = service.transcribe(
+            file_path=temp_audio_file,
+            language="English",
+            conversation_type=ConversationType.INTERVIEW,
+        )
+
+        assert result.text == "Fallback transcription"
+
+        # Verify the second call used the fallback model
+        calls = mock_client.models.generate_content.call_args_list
+        assert len(calls) == 2
+        assert calls[1].kwargs["model"] == GEMINI_FALLBACK_MODEL
+
+    @patch("src.api.transcription_service.genai")
+    def test_transcribe_reraises_non_503_server_error(self, mock_genai, temp_audio_file):
+        """Should re-raise ServerError for non-503 status codes."""
+        mock_client = MagicMock()
+        mock_genai.Client.return_value = mock_client
+
+        mock_client.models.generate_content.side_effect = ServerError(500, {"error": {"message": "internal error"}})
+
+        service = TranscriptionService(api_key="test-key")
+
+        with pytest.raises(TranscriptionError, match="Transcription failed"):
+            service.transcribe(
+                file_path=temp_audio_file,
+                language="English",
+                conversation_type=ConversationType.INTERVIEW,
+            )

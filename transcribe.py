@@ -1,4 +1,4 @@
-import google.generativeai as genai
+from google import genai
 import tkinter as tk
 from tkinter import filedialog
 import time
@@ -11,10 +11,7 @@ api_key = os.getenv("GEMINI_API_KEY")
 if not api_key:
     print("Error: GEMINI_API_KEY not found. Please set it in your .env file.")
     exit(1)
-genai.configure(api_key=api_key)
-
-# Initialize Gemini model
-model = genai.GenerativeModel("gemini-3-flash-preview")
+client = genai.Client(api_key=api_key)
 
 # File selection window
 root = tk.Tk()
@@ -74,7 +71,16 @@ else:
 
 # Upload audio file
 print("\nUploading audio file...")
-audio_file = genai.upload_file(audio_path)
+audio_file = client.files.upload(file=audio_path)
+
+while audio_file.state == "PROCESSING":
+    print("File still processing, waiting...")
+    time.sleep(2)
+    audio_file = client.files.get(name=audio_file.name)
+
+if audio_file.state == "FAILED":
+    print("Error: File processing failed on Google's servers.")
+    exit(1)
 
 # Create prompt based on conversation type
 if conv_type == "interview":
@@ -99,7 +105,7 @@ Format:
 print("Processing... Please wait")
 start_time = time.time()
 
-response = model.generate_content([prompt, audio_file])
+response = client.models.generate_content(model="gemini-3-flash-preview", contents=[prompt, audio_file])
 
 end_time = time.time()
 elapsed_time = end_time - start_time

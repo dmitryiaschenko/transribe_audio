@@ -14,6 +14,7 @@ LOGS_DIR.mkdir(exist_ok=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = "gemini-3-flash-preview"
+GEMINI_FALLBACK_MODEL = "gemini-flash-latest"
 
 # Web server configuration
 UPLOAD_DIR = BASE_DIR / "uploads"
